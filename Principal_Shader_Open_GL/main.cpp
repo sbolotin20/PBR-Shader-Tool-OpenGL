@@ -1,0 +1,560 @@
+﻿// main.cpp - Complete PBR Shader with ImGui Controls
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <iostream>
+#include <filesystem>
+
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+
+// IMGUI
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h"
+#include "ImGuiFileDialog.h"
+using IGFD::FileDialogConfig;   
+
+float cameraZoom = 5.0f;
+
+void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
+    if (ImGui::GetIO().WantCaptureMouse) return;
+
+    cameraZoom -= static_cast<float>(yoffset);
+    if (cameraZoom < 1.0f)
+        cameraZoom = 1.0f;
+    if (cameraZoom > 1000.0f)
+        cameraZoom = 1000.0f;
+}
+
+#include <glm/gtc/type_ptr.hpp>
+
+#include "External/stb_image.h"
+#include "External/tinyobjloader/tiny_obj_loader.h"
+#include "shader_utils.h"
+#include "texture_utils.h"
+#include "mesh_utils.h"
+#include "uniforms.h"
+
+// ─────────────────────────────────────────────
+// Window Settings
+// ─────
+const unsigned int SCR_WIDTH = 800;
+const unsigned int SCR_HEIGHT = 600;
+
+// globals
+GLuint baseColorTextureID;
+GLuint normalMapTextureID;
+GLuint roughnessTextureID;
+GLuint metallicTextureID;
+GLuint hdrTextureID;
+GLuint aoTextureID;
+
+static void Reload2D(GLuint &tex, const std::string& path) {
+    if (tex) glDeleteTextures(1, &tex);
+    tex = LoadTexture2D(path);
+}
+static void ReloadHDR(GLuint &hdrTex, GLuint &envCubemap, GLuint &irradianceMap, const std::string& path) {
+    if (hdrTex) glDeleteTextures(1, &hdrTex);
+    hdrTex = LoadHDRTexture(path);
+    if (envCubemap) glDeleteTextures(1, &envCubemap);
+    envCubemap = EquirectToCubemap(hdrTex, 0, 0, 512);
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+    if (irradianceMap) glDeleteTextures(1, &irradianceMap);
+    irradianceMap = ConvolveIrradiance(envCubemap);
+}
+
+// ---- Mouse Controls ----
+float pitch = 0.0f;
+float yaw = 0.0f;
+bool dragging = false;
+double lastX = 0.0, lastY = 0.0;
+
+void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        dragging = (action == GLFW_PRESS);
+        glfwGetCursorPos(window, &lastX, &lastY); // reset origin when drag starts
+    }
+}
+
+void cursor_position_callback(GLFWwindow* window, double xpos, double ypos) {
+    if (dragging && !ImGui::GetIO().WantCaptureMouse) {
+        float dx = static_cast<float>(xpos - lastX);
+        float dy = static_cast<float>(ypos - lastY);
+
+        yaw   += dx * 0.3f; // sensitivity
+        pitch += dy * 0.3f;
+
+        // clamp pitch to prevent flipping
+        pitch = glm::clamp(pitch, -89.0f, 89.0f);
+    }
+
+    lastX = xpos;
+    lastY = ypos;
+}
+
+// ─────────────────────────────────────────────
+// Main
+int main() {
+    std::cout << "OpenGL PBR Project Starting..." << std::endl;
+    std::cout << "Working directory: " << std::filesystem::current_path() << std::endl;
+
+    // ------ Initialize GLFW and Create Window ------
+    glfwInit();
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "PBR Shader Tool", NULL, NULL);
+    glfwSetScrollCallback(window, scroll_callback);
+    if (window == NULL) {
+        std::cout << "Failed to create GLFW window" << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    glfwSetMouseButtonCallback(window, mouse_button_callback);
+    glfwSetCursorPosCallback(window, cursor_position_callback);
+
+    glfwMakeContextCurrent(window);
+    
+    // ----- Load OpenGL functions with GLAD -----
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+        std::cerr << "Failed to initialize GLAD" << std::endl;
+        return -1;
+    }
+
+    int w, h;
+    glfwGetFramebufferSize(window, &w, &h);
+    glViewport(0, 0, w, h);
+
+    // ----- Initialize ImGui -----
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+
+    // Setup Platform/Renderer bindings
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 330");
+
+    // Setup Style
+    ImGui::StyleColorsDark();
+
+    // ----- Compile and Link Shaders ------
+    std::string vertexSource = ReadTextFile("shaders/basic.vert");
+    std::string fragSource = ReadTextFile("shaders/basic.frag");
+
+    std::cout << "Vertex shader source length: " << vertexSource.length() << std::endl;
+    std::cout << "Fragment shader source length: " << fragSource.length() << std::endl;
+
+    GLuint vertex_shader = CompileShader(GL_VERTEX_SHADER, vertexSource.c_str());
+    GLuint frag_shader = CompileShader(GL_FRAGMENT_SHADER, fragSource.c_str());
+    GLuint shader_program = LinkProgram(vertex_shader, frag_shader);
+
+    // Check shader program status
+    GLint success;
+    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetProgramInfoLog(shader_program, 512, NULL, infoLog);
+        std::cout << "SHADER LINKING FAILED: " << infoLog << std::endl;
+    } else {
+        std::cout << "Main shader program linked successfully!" << std::endl;
+    }
+
+    // Set up object geometry
+    Mesh currentMesh;
+    bool usingCustomMesh = false;
+    if (std::filesystem::exists("model.obj")) {
+        currentMesh = loadObjModel("model.obj");
+        usingCustomMesh = true;
+    } else {
+        currentMesh = createCube();
+    }
+    // ---- Load Textures -----
+    baseColorTextureID = LoadTexture2D("textures/GoldPaint_BaseColor.jpg");
+    normalMapTextureID = LoadTexture2D("textures/GoldPaint_Normal.png");
+    roughnessTextureID = LoadTexture2D("textures/GoldPaint_Roughness.jpg");
+    metallicTextureID = LoadTexture2D("textures/GoldPaint_Metallic.jpg");
+    aoTextureID = LoadTexture2D("textures/GoldPaint_AmbientOcclusion.jpg");
+    hdrTextureID = LoadHDRTexture("textures/sky.hdr");
+    std::cout << "HDR texture ID: " << hdrTextureID << std::endl;
+
+    // Debug: Read back a pixel to verify HDR loaded
+    if (hdrTextureID != 0) {
+        int width, height;
+        glBindTexture(GL_TEXTURE_2D, hdrTextureID);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+        std::cout << "HDR texture size: " << width << "x" << height << std::endl;
+        
+        // Check for GL errors
+        GLenum err = glGetError();
+        if (err != GL_NO_ERROR) {
+            std::cout << "OpenGL error after HDR load: " << err << std::endl;
+        }
+    }
+    
+    // Set up Environment Cubemap and Irradiance Map
+    GLuint envCubemap = EquirectToCubemap(hdrTextureID, 0, 0, 512);
+    glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap);
+    glGenerateMipmap(GL_TEXTURE_CUBE_MAP);  // CRITICAL!
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS);
+    GLuint irradianceMap = ConvolveIrradiance(envCubemap);
+    std::cout << "Environment cubemap ID: " << envCubemap << ", Irradiance map ID: " << irradianceMap << std::endl;
+
+    // ----- Compile Skybox Shaders -----
+    std::string sbVS = ReadTextFile("shaders/skybox.vert");
+    std::string sbFS = ReadTextFile("shaders/skybox.frag");
+    GLuint sbV = CompileShader(GL_VERTEX_SHADER, sbVS.c_str());
+    GLuint sbF = CompileShader(GL_FRAGMENT_SHADER, sbFS.c_str());
+    GLuint sbProg = LinkProgram(sbV, sbF);
+    
+    glGetProgramiv(sbProg, GL_LINK_STATUS, &success);
+    if (!success) {
+        char infoLog[512];
+        glGetProgramInfoLog(sbProg, 512, NULL, infoLog);
+        std::cout << "SKYBOX SHADER LINKING FAILED: " << infoLog << std::endl;
+    } else {
+        std::cout << "Skybox shader linked successfully!" << std::endl;
+    }
+    
+    glUseProgram(sbProg);
+    glUniform1i(glGetUniformLocation(sbProg, "env"), 0);
+    GLint sbView = glGetUniformLocation(sbProg, "view");
+    GLint sbProj = glGetUniformLocation(sbProg, "projection");
+
+    // ----- Get Uniform Locations -----
+    LightingUniforms lightUniforms = getLightingUniforms(shader_program);
+    MaterialUniforms matUniforms = getMaterialUniforms(shader_program);
+    VertexUniforms vertUniforms = getVertexUniforms(shader_program);
+
+    // ----- ImGui Control Variables -----
+    static float roughness = 0.8f;
+    static float metallic = 0.0f;
+    static float baseTintColor[3] = {1.0f, 1.0f, 1.0f};
+    static float lightDir[3] = {0.0f, -0.7f, 0.3f};
+    static float lightColor[3] = {1.0f, 1.0f, 1.0f};
+    static float lightIntensity = 3.0f;
+    static bool useBaseColorTex = true;
+    static bool useNormalMap = true;
+    static bool useRoughnessMap = true;
+    static bool useMetallicMap = false;
+    static bool useAOMap = false;
+    static bool useIBL = true;
+    static float exposure = 1.0f;
+    static int currentToneMapping = 0;
+
+    // ----- Set Initial Uniform Values -----
+    glUseProgram(shader_program);
+    glUniform1i(matUniforms.uUseBaseTex, useBaseColorTex ? 1 : 0);
+    glUniform1i(matUniforms.uBaseTex, 0);
+    glUniform3f(matUniforms.uBaseTint, baseTintColor[0], baseTintColor[1], baseTintColor[2]);
+    glUniform1f(matUniforms.uRoughness, roughness);  
+    glUniform1f(matUniforms.uMetallic, metallic);
+    glUniform3f(matUniforms.uDielectricF0, 0.04f, 0.04f, 0.04f);
+    glUniform1i(matUniforms.uNormalTex, 1);
+    glUniform1i(matUniforms.uUseNormalTex, useNormalMap ? 1 : 0);
+    glUniform1i(matUniforms.uRoughnessMap, 2);
+    glUniform1i(matUniforms.uUseRoughnessMap, useRoughnessMap ? 1 : 0);
+    glUniform1i(matUniforms.uMetallicMap, 3);
+    glUniform1i(matUniforms.uUseMetallicMap, useMetallicMap ? 1 : 0);
+    glUniform1i(matUniforms.uAOMap, 4);
+    glUniform1i(matUniforms.uUseAOMap, useAOMap ? 1 : 0);
+
+    glUniform1i(lightUniforms.uLightType, 0);
+    glUniform3f(lightUniforms.uLightColor, lightColor[0] * lightIntensity, lightColor[1] * lightIntensity, lightColor[2] * lightIntensity);
+    glUniform3f(lightUniforms.uAmbient, 0.1f, 0.1f, 0.1f);
+    glUniform1f(lightUniforms.uSpotCosInner, cosf(glm::radians(15.0f)));
+    glUniform1f(lightUniforms.uSpotCosOuter, cosf(glm::radians(25.0f)));
+    glUniform3f(lightUniforms.uCamPos, 0.0f, 0.0f, 5.0f);
+
+    // Set projection matrix
+    glm::mat4 projection = glm::perspective(
+        glm::radians(45.0f),
+        (float)SCR_WIDTH / SCR_HEIGHT,
+        0.1f,
+        100.0f
+    );
+    glUniformMatrix4fv(vertUniforms.projectionMatrix, 1, GL_FALSE, glm::value_ptr(projection));
+
+    // ----- Render Settings -----
+    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    glEnable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+
+    std::cout << "Starting render loop..." << std::endl;
+
+    // ----- MAIN RENDER LOOP -----
+    while (!glfwWindowShouldClose(window)) {
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        // ----- Start ImGui Frame -----
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // ----- ImGui Controls -----
+        ImGui::Begin("PBR Material Controls");
+
+        ImGui::Text("Object Loader");
+        IGFD::FileDialogConfig config;
+        config.path = ".";
+
+        if (ImGui::Button("Choose Object")) {
+            FileDialogConfig cfg; 
+            cfg.path = ".";                   // start folder
+            cfg.countSelectionMax = 1;
+            cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "ChooseObj", "Choose Object",
+                ".obj", cfg);
+        }
+        if (ImGuiFileDialog::Instance()->Display("ChooseObj")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                currentMesh = loadObjModel(path);
+                usingCustomMesh = true;
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+        ImGui::Separator();
+
+        ImGui::Separator();
+        ImGui::Text("Load Texture Maps");
+        // --- File pickers ---
+        if (ImGui::Button("Load Base Color")) {
+            FileDialogConfig cfg; 
+            cfg.path = ".";                   // start folder
+            cfg.countSelectionMax = 1;
+            cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "PickBase", "Choose Base Color",
+                "Image files{.png,.jpg,.jpeg,.bmp,.tga}", cfg);
+        }
+
+        if (ImGui::Button("Load Normal")) {
+            FileDialogConfig cfg; cfg.path = "."; cfg.countSelectionMax = 1; cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "PickNormal", "Choose Normal Map",
+                "Image files{.png,.jpg,.jpeg,.bmp,.tga}", cfg);
+        }
+
+        if (ImGui::Button("Load Roughness")) {
+            FileDialogConfig cfg; cfg.path = "."; cfg.countSelectionMax = 1; cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "PickRough", "Choose Roughness Map",
+                "Image files{.png,.jpg,.jpeg,.bmp,.tga}", cfg);
+        }
+
+        if (ImGui::Button("Load Metallic")) {
+            FileDialogConfig cfg; cfg.path = "."; cfg.countSelectionMax = 1; cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "PickMetallic", "Choose Metallic Map",
+                "Image files{.png,.jpg,.jpeg,.bmp,.tga}", cfg);
+        }
+
+        if (ImGui::Button("Load AO")) {
+            FileDialogConfig cfg; cfg.path = "."; cfg.countSelectionMax = 1; cfg.flags = ImGuiFileDialogFlags_Modal;
+            ImGuiFileDialog::Instance()->OpenDialog(
+                "PickAO", "Choose Ambient Occlusion Map",
+                "Image files{.png,.jpg,.jpeg,.bmp,.tga}", cfg);
+        }
+
+        // --- Handle results ---
+        if (ImGuiFileDialog::Instance()->Display("PickBase")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                Reload2D(baseColorTextureID, path);
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+        if (ImGuiFileDialog::Instance()->Display("PickNormal")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                Reload2D(normalMapTextureID, path);
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+        if (ImGuiFileDialog::Instance()->Display("PickRough")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                Reload2D(roughnessTextureID, path);
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+        if (ImGuiFileDialog::Instance()->Display("PickMetallic")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                Reload2D(metallicTextureID, path);
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+
+        if (ImGuiFileDialog::Instance()->Display("PickAO")) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+                Reload2D(aoTextureID, path);
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+
+        ImGui::Separator();
+        if (ImGui::Checkbox("Use Base Color Texture", &useBaseColorTex)) {
+            glUseProgram(shader_program);
+            glUniform1i(matUniforms.uUseBaseTex, useBaseColorTex ? 1 : 0);
+        }
+        if (ImGui::Checkbox("Use Normal Map", &useNormalMap)) {
+            glUseProgram(shader_program);
+            glUniform1i(matUniforms.uUseNormalTex, useNormalMap ? 1 : 0);
+        }
+        if (ImGui::Checkbox("Use Roughness Map", &useRoughnessMap)) {
+            glUseProgram(shader_program);
+            glUniform1i(matUniforms.uUseRoughnessMap, useRoughnessMap ? 1 : 0);
+        }
+        if (ImGui::Checkbox("Use Metallic Map", &useMetallicMap)) {
+            glUseProgram(shader_program);
+            glUniform1i(matUniforms.uUseMetallicMap, useMetallicMap ? 1 : 0);
+        }
+        if (ImGui::Checkbox("Use AO Map", &useAOMap)) {
+            glUseProgram(shader_program);
+            glUniform1i(glGetUniformLocation(shader_program, "useAOMap"), useAOMap ? 1 : 0);
+        }
+        if (ImGui::Checkbox("Use IBL", &useIBL)) {
+            glUseProgram(shader_program);
+            glUniform1i(glGetUniformLocation(shader_program, "useIBL"), useIBL ? 1 : 0);
+        }
+
+        ImGui::Text("Material Properties");
+        if (ImGui::SliderFloat("Roughness", &roughness, 0.0f, 1.0f)) {
+            glUseProgram(shader_program);
+            glUniform1f(matUniforms.uRoughness, roughness);
+        }
+        if (ImGui::SliderFloat("Metallic", &metallic, 0.0f, 1.0f)) {
+            glUseProgram(shader_program);
+            glUniform1f(matUniforms.uMetallic, metallic);
+        }
+        if (ImGui::ColorEdit3("Base Tint", baseTintColor)) {
+            glUseProgram(shader_program);
+            glUniform3f(matUniforms.uBaseTint, baseTintColor[0], baseTintColor[1], baseTintColor[2]);
+        }
+
+        ImGui::Separator();
+        ImGui::Text("Lighting");
+        if (ImGui::SliderFloat3("Light Direction", lightDir, -1.0f, 1.0f)) {
+            glm::vec3 dir = glm::normalize(glm::vec3(lightDir[0], lightDir[1], lightDir[2]));
+            glUseProgram(shader_program);
+            glUniform3f(lightUniforms.uDirDir, dir.x, dir.y, dir.z);
+        }
+        if (ImGui::ColorEdit3("Light Color", lightColor)) {
+            glUseProgram(shader_program);
+            glUniform3f(lightUniforms.uLightColor, lightColor[0] * lightIntensity, lightColor[1] * lightIntensity, lightColor[2] * lightIntensity);
+        }
+        if (ImGui::SliderFloat("Light Intensity", &lightIntensity, 0.0f, 100.0f)) {
+            glUseProgram(shader_program);
+            glUniform3f(lightUniforms.uLightColor, lightColor[0] * lightIntensity, lightColor[1] * lightIntensity, lightColor[2] * lightIntensity);
+        }
+        
+        ImGui::End();
+
+        // ----- Render Main Object -----
+        // Make sure viewport is correct for 3D rendering
+        glfwGetFramebufferSize(window, &w, &h);
+        glViewport(0, 0, w, h);
+        glUseProgram(shader_program);
+
+        // Bind textures
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, baseColorTextureID);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, normalMapTextureID);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, roughnessTextureID);
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D, metallicTextureID);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D, aoTextureID);  // Fix: 2D texture, not cubemap
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, irradianceMap);
+        glActiveTexture(GL_TEXTURE6);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap);
+        
+        // Set IBL uniforms
+        glUniform1i(glGetUniformLocation(shader_program, "useIBL"), useIBL ? 1 : 0);
+        glUniform1i(glGetUniformLocation(shader_program, "irradianceMap"), 5);
+        glUniform1i(glGetUniformLocation(shader_program, "environmentMap"), 6);
+
+        // Update time-based lighting
+        float time = glfwGetTime();
+        float elev = 0.15f + 0.65f * 0.5f * (1.0f + sin(time * 0.7f));
+        glm::vec3 animatedDir = glm::normalize(glm::vec3(0.0f, -cos(elev), sin(elev)));
+        
+        // Camera controls
+        glm::vec3 target = glm::vec3(0.0f); // point to orbit around
+        float camX = cameraZoom * cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+        float camY = cameraZoom * sin(glm::radians(pitch));
+        float camZ = cameraZoom * sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+        glm::vec3 cameraPos = glm::vec3(camX, camY, camZ);
+        glUniform3fv(lightUniforms.uCamPos, 1, glm::value_ptr(cameraPos));
+        // Force light direction pointing down at the surface
+        //glUniform3f(lightUniforms.uDirDir, 1.0f, -1.0f, -1.0f);
+
+        // mouse movements
+        glm::mat4 model = glm::mat4(1.0f);
+        model = glm::rotate(model, glm::radians(yaw), glm::vec3(0.0f, 1.0f, 0.0f));   // left-right
+        model = glm::rotate(model, glm::radians(pitch), glm::vec3(1.0f, 0.0f, 0.0f)); // up-down
+
+        glm::mat4 view = glm::lookAt(cameraPos, target, glm::vec3(0.0f, 1.0f, 0.0f));
+        glUniformMatrix4fv(vertUniforms.modelMatrix, 1, GL_FALSE, glm::value_ptr(model));
+        glUniformMatrix4fv(vertUniforms.viewMatrix, 1, GL_FALSE, glm::value_ptr(view));
+
+        // Draw the cube
+        currentMesh.draw();
+
+        // ----- Render Skybox -----
+        glm::mat4 R = glm::rotate(glm::mat4(1.0f), time * 0.25f, glm::vec3(0,1,0));
+        R = glm::rotate(R, 0.3f * sin(time * 0.2f), glm::vec3(1,0,0));
+        glm::mat4 viewSky = glm::mat4(glm::mat3(view * R));
+
+        glDepthFunc(GL_LEQUAL);
+        glUseProgram(sbProg);
+        glUniformMatrix4fv(sbView, 1, GL_FALSE, glm::value_ptr(viewSky));
+        glUniformMatrix4fv(sbProj, 1, GL_FALSE, glm::value_ptr(projection));
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, envCubemap);
+        renderCube();
+        glDepthFunc(GL_LESS);
+
+        // ----- Render ImGui -----
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        glfwSwapBuffers(window);
+        glfwPollEvents();
+    }
+
+    // ----- Cleanup -----
+    glDeleteShader(vertex_shader);
+    glDeleteShader(frag_shader);
+    glDeleteProgram(shader_program);
+    glDeleteProgram(sbProg);
+    glDeleteTextures(1, &baseColorTextureID);
+    glDeleteTextures(1, &normalMapTextureID);
+    glDeleteTextures(1, &roughnessTextureID);
+    glDeleteTextures(1, &metallicTextureID);
+    glDeleteTextures(1, &aoTextureID);
+    glDeleteTextures(1, &hdrTextureID);
+    glDeleteTextures(1, &envCubemap);
+    glDeleteTextures(1, &irradianceMap);
+    currentMesh.cleanup();
+    
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    
+    glfwTerminate();
+    return 0;
+}
