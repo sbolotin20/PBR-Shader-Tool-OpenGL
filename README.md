@@ -6,7 +6,7 @@ I built this tool from scratch to better understand how modern shading works und
 
 ---
 
-![screenshot](Principal_Shader_Open_GL/demo reel/Screenshot 2025-12-07 134634.png) <!-- Replace this with an actual screenshot path -->
+<img width="1443" height="566" alt="Screenshot 2025-12-07 134634" src="https://github.com/user-attachments/assets/53017619-46df-4abe-80a2-f179a06c6ceb" />
 
 ## Features
 
@@ -106,15 +106,10 @@ make
 ### What I Learned
 
 This project helped me gain deep technical understanding of:
-
-PBR lighting models (Fresnel, GGX, Smith geometry)
-
-IBL theory and importance of convolved irradiance
-
-Real-time shader optimization and mipmap sampling
-
-Cross-domain workflows between OpenGL and real-time art
-
+- PBR lighting models (Fresnel, GGX, Smith geometry)
+- IBL theory and importance of convolved irradiance
+- Real-time shader optimization and mipmap sampling
+- Cross-domain workflows between OpenGL and real-time art
 It’s built to showcase not just visual quality, but clarity in code and modular architecture — critical skills for any Technical Artist working at the rendering pipeline level.
 
 ### Demo Reel
