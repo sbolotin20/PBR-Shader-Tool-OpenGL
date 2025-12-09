@@ -145,6 +145,8 @@ void main()
     vec3 numerator = D * G * F;
     float denominator = 4.0 * max(NdotV * NdotL, 0.001);
     vec3 specular = numerator / denominator;
+    specular *= (1.0 - roughness * roughness);
+
     
     // At roughness = 1.0, specular should be nearly invisible
     float specularAttenuation = pow(1.0 - roughness, 2.5);
@@ -154,8 +156,12 @@ void main()
     vec3 kD = vec3(1.0) - kS;
     kD *= 1.0 - metallic;
     
-    vec3 radiance = uLight_Color * attenuation;
-    vec3 Lo = (kD * baseColor / 3.14159265 + specular) * radiance * NdotL;
+    vec3 lightColor = uLight_Color; // already includes intensity in your app
+    vec3 radiance = lightColor * attenuation;
+
+    vec3 diffuse = kD * baseColor / 3.14159265;
+    vec3 Lo = (diffuse + specular) * radiance * NdotL;
+
     
     // ========== AMBIENT/IBL ==========
     vec3 ambient = vec3(0.0);
@@ -182,6 +188,8 @@ void main()
         vec3 specular_ibl = prefilteredColor * F_ambient;
         float iblSpecularAttenuation = pow(1.0 - roughness, 2.0);
         specular_ibl *= iblSpecularAttenuation;
+        float fresnelFade = pow(1.0 - roughness, 2.0);
+        specular_ibl *= fresnelFade;
         ambient = (diffuse_ibl + specular_ibl) * ao;
     } else {
         // No IBL fallback

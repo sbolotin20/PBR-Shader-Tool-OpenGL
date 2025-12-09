@@ -271,6 +271,8 @@ int main() {
     glUniform1f(lightUniforms.uSpotCosInner, cosf(glm::radians(15.0f)));
     glUniform1f(lightUniforms.uSpotCosOuter, cosf(glm::radians(25.0f)));
     glUniform3f(lightUniforms.uCamPos, 0.0f, 0.0f, 5.0f);
+    glm::vec3 initialDir = glm::normalize(glm::vec3(lightDir[0], lightDir[1], lightDir[2]));
+    glUniform3f(lightUniforms.uDirDir, initialDir.x, initialDir.y, initialDir.z);
 
     // Set projection matrix
     glm::mat4 projection = glm::perspective(
@@ -466,6 +468,9 @@ int main() {
         glViewport(0, 0, w, h);
         glUseProgram(shader_program);
 
+        // REMOVED: This was overriding the ImGui slider values!
+        // Lines 469-472 have been deleted
+        
         // Bind textures
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, baseColorTextureID);
